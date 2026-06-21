@@ -295,4 +295,4 @@ FH6 introduces three new telemetry fields (`CarGroup`, `SmashableVelDiff`, `Smas
 
 ## License
 
-MIT License — see [LICENSE](#LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.

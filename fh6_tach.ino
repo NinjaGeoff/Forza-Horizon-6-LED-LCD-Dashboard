@@ -59,25 +59,25 @@ static void buildTickerLine(char* buf, const char* msg, int msgLen, int gPos) {
 }
 
 // HTML processor to populate live configurations in inputs dynamically
+// Create a global snapshot structure just for the web server to look at safely
+DeviceConfig webSnapshot;
+
 String processor(const String& var) {
-  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    String val = "";
-    if(var == "SCALE_BRIGHTNESS") val = String(cfg.scaleBrightness);
-    else if(var == "WHITE_BG_FACTOR") val = String(cfg.whiteBrightnessFactor);
-    else if(var == "LED_OFFSET") val = String(cfg.ledOffset);
-    else if(var == "REVERSED_FALSE") val = !cfg.ledReversed ? "selected" : "";
-    else if(var == "REVERSED_TRUE") val = cfg.ledReversed ? "selected" : "";
-    else if(var == "RPM_GREEN") val = String(cfg.rpmGreenStart);
-    else if(var == "RPM_YELLOW") val = String(cfg.rpmYellowStart);
-    else if(var == "RPM_RED") val = String(cfg.rpmRedStart);
-    else if(var == "RPM_FLASH") val = String(cfg.rpmFlashStart);
-    else if(var == "ZONE_GREEN") val = String(cfg.zoneGreenCount);
-    else if(var == "ZONE_YELLOW") val = String(cfg.zoneYellowCount);
-    else if(var == "ZONE_RED") val = String(cfg.zoneRedCount);
-    xSemaphoreGive(g_mutex);
-    return val;
-  }
-  return String();
+  // No mutex locks inside here anymore! We read directly from our safe snapshot.
+  if(var == "SCALE_BRIGHTNESS")      return String(webSnapshot.scaleBrightness);
+  if(var == "WHITE_BG_FACTOR")     return String(webSnapshot.whiteBrightnessFactor, 2); // 2 decimal places
+  if(var == "LED_OFFSET")           return String(webSnapshot.ledOffset);
+  if(var == "REVERSED_FALSE")       return !webSnapshot.ledReversed ? "selected" : "";
+  if(var == "REVERSED_TRUE")        return webSnapshot.ledReversed ? "selected" : "";
+  if(var == "RPM_GREEN")            return String(webSnapshot.rpmGreenStart, 2);
+  if(var == "RPM_YELLOW")           return String(webSnapshot.rpmYellowStart, 2);
+  if(var == "RPM_RED")              return String(webSnapshot.rpmRedStart, 2);
+  if(var == "RPM_FLASH")            return String(webSnapshot.rpmFlashStart, 2);
+  if(var == "ZONE_GREEN")           return String(webSnapshot.zoneGreenCount);
+  if(var == "ZONE_YELLOW")          return String(webSnapshot.zoneYellowCount);
+  if(var == "ZONE_RED")             return String(webSnapshot.zoneRedCount);
+  
+  return String(); // Always return an empty string if no tag matches
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -96,11 +96,33 @@ void udpTask(void* pvParameters) {
   Serial.print("[WEB UI] URL: http://");
   Serial.println(WiFi.localIP());
 
-  // Setup asynchronous routes
+// Route 1: Serve the raw index_html string statically (No template processing overhead)
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/html", index_html, processor);
+    request->send(200, "text/html", index_html);
   });
 
+  // Route 2: Provide a simple, fast API endpoint for current configurations
+  server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json = "{";
+    if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(15)) == pdTRUE) {
+      json += "\"scaleBrightness\":" + String(cfg.scaleBrightness) + ",";
+      json += "\"whiteBrightnessFactor\":" + String(cfg.whiteBrightnessFactor, 2) + ",";
+      json += "\"ledOffset\":" + String(cfg.ledOffset) + ",";
+      json += "\"ledReversed\":" + String(cfg.ledReversed ? "true" : "false") + ",";
+      json += "\"rpmGreenStart\":" + String(cfg.rpmGreenStart, 2) + ",";
+      json += "\"rpmYellowStart\":" + String(cfg.rpmYellowStart, 2) + ",";
+      json += "\"rpmRedStart\":" + String(cfg.rpmRedStart, 2) + ",";
+      json += "\"rpmFlashStart\":" + String(cfg.rpmFlashStart, 2) + ",";
+      json += "\"zoneGreenCount\":" + String(cfg.zoneGreenCount) + ",";
+      json += "\"zoneYellowCount\":" + String(cfg.zoneYellowCount) + ",";
+      json += "\"zoneRedCount\":" + String(cfg.zoneRedCount);
+      xSemaphoreGive(g_mutex);
+    }
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  // Route 3: Handle form updates (Keep this exactly as it was)
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request){
     if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         if(request->hasParam("scaleBrightness", true)) cfg.scaleBrightness = request->getParam("scaleBrightness", true)->value().toInt();
@@ -120,6 +142,7 @@ void udpTask(void* pvParameters) {
   });
 
   server.begin();
+  Serial.println("[WEB UI] Static Web Server Running. JSON Endpoint mapped.");
 
   WiFiUDP udp;
   udp.begin(UDP_PORT);

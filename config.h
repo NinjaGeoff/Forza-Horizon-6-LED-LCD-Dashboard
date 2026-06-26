@@ -14,6 +14,12 @@
 #define LED_TYPE         WS2812B
 #define COLOR_ORDER      GRB         
 
+// ─── Base Target Colors ────────────────────────────────────────────────────
+#define BASE_COLOR_GREEN  CRGB::Green
+#define BASE_COLOR_YELLOW CRGB::Yellow
+#define BASE_COLOR_RED    CRGB::Red
+#define BASE_COLOR_PURPLE CRGB::Purple
+
 // ─── Speed Units ───────────────────────────────────────────────────────────
 #define SPEED_UNIT_MPH
 

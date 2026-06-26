@@ -178,7 +178,6 @@ A dedicated **5V 2A USB charger is highly recommended**. Estimated draws at defa
 
 ## License
 
-MIT License — see [LICENSE](https://www.google.com/search?q=LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ```
-***

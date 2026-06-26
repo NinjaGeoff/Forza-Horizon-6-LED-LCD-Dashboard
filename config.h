@@ -50,4 +50,5 @@ struct DeviceConfig {
     int zoneGreenCount = 23;
     int zoneYellowCount = 11;
     int zoneRedCount = 11;
+    bool pauseLedsOn = true; // true = Solid Purple, false = Total Blackout
 };

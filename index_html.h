@@ -13,9 +13,12 @@ const char index_html[] PROGMEM = R"rawliteral(
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; font-size: 14px;}
         input[type="number"] { width: 100%; box-sizing: border-box; padding: 8px; background: #3a3a3e; border: 1px solid #555; color: #fff; border-radius: 4px; }
-        select { width: 100%; padding: 8px; background: #3a3a3e; border: 1px solid #555; color: #fff; border-radius: 4px; }
-        button { width: 100%; padding: 12px; background: #ff4757; border: none; color: white; font-size: 16px; border-radius: 4px; cursor: pointer; font-weight: bold; }
-        button:hover { background: #ff6b81; }
+        select { width: 100%; padding: 8px; background: #3a3a3e; border: 1px solid #555; color: #fff; border-radius: 4px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; border: none; color: white; font-size: 16px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-bottom: 10px; }
+        .btn-apply { background: #ff4757; }
+        .btn-apply:hover { background: #ff6b81; }
+        .btn-reset { background: #4e4e54; }
+        .btn-reset:hover { background: #62626a; }
         .row { display: flex; gap: 10px; }
         .row .form-group { flex: 1; }
     </style>
@@ -64,29 +67,53 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div class="form-group"><label>Red</label><input type="number" id="zoneRedCount" name="zoneRedCount" value="11"></div>
         </div>
 
-        <button type="submit">Apply Settings</button>
+        <h3>Game Paused State</h3>
+        <div class="form-group">
+            <label>Idle LED Behavior</label>
+            <select id="pauseLedsOn" name="pauseLedsOn">
+                <option value="1">Solid Purple (On)</option>
+                <option value="0">Disabled (Off / Blackout)</option>
+            </select>
+        </div>
+
+        <button type="submit" class="btn-apply">Apply Settings</button>
+        <button type="button" id="resetBtn" class="btn-reset">Reset to Defaults</button>
     </form>
 </div>
 
 <script>
-    // Fetch current settings as json from the ESP32 dynamically after page loads
+    function populateForm(data) {
+        document.getElementById('scaleBrightness').value = data.scaleBrightness;
+        document.getElementById('whiteBrightnessFactor').value = data.whiteBrightnessFactor;
+        document.getElementById('ledOffset').value = data.ledOffset;
+        document.getElementById('ledReversed').value = data.ledReversed ? "1" : "0";
+        document.getElementById('rpmGreenStart').value = data.rpmGreenStart;
+        document.getElementById('rpmYellowStart').value = data.rpmYellowStart;
+        document.getElementById('rpmRedStart').value = data.rpmRedStart;
+        document.getElementById('rpmFlashStart').value = data.rpmFlashStart;
+        document.getElementById('zoneGreenCount').value = data.zoneGreenCount;
+        document.getElementById('zoneYellowCount').value = data.zoneYellowCount;
+        document.getElementById('zoneRedCount').value = data.zoneRedCount;
+        document.getElementById('pauseLedsOn').value = data.pauseLedsOn ? "1" : "0";
+    }
+
     window.addEventListener('DOMContentLoaded', () => {
         fetch('/config')
             .then(res => res.json())
-            .then(data => {
-                document.getElementById('scaleBrightness').value = data.scaleBrightness;
-                document.getElementById('whiteBrightnessFactor').value = data.whiteBrightnessFactor;
-                document.getElementById('ledOffset').value = data.ledOffset;
-                document.getElementById('ledReversed').value = data.ledReversed ? "1" : "0";
-                document.getElementById('rpmGreenStart').value = data.rpmGreenStart;
-                document.getElementById('rpmYellowStart').value = data.rpmYellowStart;
-                document.getElementById('rpmRedStart').value = data.rpmRedStart;
-                document.getElementById('rpmFlashStart').value = data.rpmFlashStart;
-                document.getElementById('zoneGreenCount').value = data.zoneGreenCount;
-                document.getElementById('zoneYellowCount').value = data.zoneYellowCount;
-                document.getElementById('zoneRedCount').value = data.zoneRedCount;
-            })
+            .then(data => populateForm(data))
             .catch(err => console.error("Error fetching live config:", err));
+    });
+
+    document.getElementById('resetBtn').addEventListener('click', () => {
+        if (confirm("Are you sure you want to restore factory defaults?")) {
+            fetch('/reset', { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    populateForm(data);
+                    alert("Defaults restored successfully!");
+                })
+                .catch(err => console.error("Error resetting defaults:", err));
+        }
     });
 </script>
 </body>

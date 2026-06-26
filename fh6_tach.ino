@@ -5,18 +5,24 @@
 #include <LiquidCrystal_I2C.h>
 #include <FastLED.h>
 #include <math.h>
+#include <ESPAsyncWebServer.h> // Required: Add to libraries
+#include <AsyncTCP.h>          // Required: Add to libraries
 #include "config.h"
+#include "index_html.h"
 
 // ─── LED Array ─────────────────────────────────────────────────────────────
 CRGB leds[NUM_LEDS];
 
-// ─── Shared State ──────────────────────────────────────────────────────────
+// ─── Shared State & Mutex Config ───────────────────────────────────────────
 volatile float    g_rpmPercent   = 0.0f;   
 volatile float    g_currentRpm   = 0.0f;   
 volatile float    g_speedMps     = 0.0f;   
-volatile uint32_t g_lastPacketMs = 0;      
-volatile bool     g_gamePaused   = true;   // Tracks if menu/pause state is active
+volatile uint32_t g_lastPacketMs = 0;   
+volatile bool     g_gamePaused   = true;   
 SemaphoreHandle_t g_mutex;
+
+DeviceConfig cfg; // Instantiates runtime settings container
+AsyncWebServer server(80);
 
 // ─── LCD ───────────────────────────────────────────────────────────────────
 LiquidCrystal_I2C* g_lcd = nullptr;        
@@ -30,29 +36,17 @@ namespace Packet {
   static constexpr uint16_t SPEED          = 256;  
 }
 
-// ─── LED Zone Logical Boundaries ───────────────────────────────────────────
-namespace Zone {
-  static constexpr uint8_t GREEN_FIRST  = 0;
-  static constexpr uint8_t YELLOW_FIRST = ZONE_GREEN_COUNT;
-  static constexpr uint8_t RED_FIRST    = ZONE_GREEN_COUNT + ZONE_YELLOW_COUNT;
-}
+// ─── Base Color Palettes ───────────────────────────────────────────────────
+static const CRGB BASE_COLOR_G = BASE_COLOR_GREEN;
+static const CRGB BASE_COLOR_Y = BASE_COLOR_YELLOW;
+static const CRGB BASE_COLOR_R = BASE_COLOR_RED;
+static const CRGB BASE_COLOR_P = BASE_COLOR_PURPLE;
 
-// ─── Scaled Color Computations ─────────────────────────────────────────────
-// Explicitly constructing CRGB objects so the compiler allows method calling
-static const CRGB COLOR_G = CRGB(BASE_COLOR_GREEN).nscale8_video(SCALE_BRIGHTNESS);
-static const CRGB COLOR_Y = CRGB(BASE_COLOR_YELLOW).nscale8_video(SCALE_BRIGHTNESS);
-static const CRGB COLOR_R = CRGB(BASE_COLOR_RED).nscale8_video(SCALE_BRIGHTNESS);
-static const CRGB COLOR_P = CRGB(BASE_COLOR_PURPLE).nscale8_video(SCALE_BRIGHTNESS);
-
-// White background calculates down from scaled limits
-static const uint8_t WHITE_VAL = (uint8_t)(SCALE_BRIGHTNESS * WHITE_BRIGHTNESS_FACTOR);
-static const CRGB    WHITE_BG  = CRGB(WHITE_VAL, WHITE_VAL, WHITE_VAL);
-
-inline int phys(int logical) {
-  if (!LED_REVERSED) {
-    return (logical + LED_OFFSET + NUM_LEDS) % NUM_LEDS;
+inline int phys(int logical, int offset, bool reversed) {
+  if (!reversed) {
+    return (logical + offset + NUM_LEDS) % NUM_LEDS;
   } else {
-    return (LED_OFFSET - logical + NUM_LEDS) % NUM_LEDS;
+    return (offset - logical + NUM_LEDS) % NUM_LEDS;
   }
 }
 
@@ -64,36 +58,77 @@ static void buildTickerLine(char* buf, const char* msg, int msgLen, int gPos) {
   buf[16] = '\0';
 }
 
+// HTML processor to populate live configurations in inputs dynamically
+String processor(const String& var) {
+  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    String val = "";
+    if(var == "SCALE_BRIGHTNESS") val = String(cfg.scaleBrightness);
+    else if(var == "WHITE_BG_FACTOR") val = String(cfg.whiteBrightnessFactor);
+    else if(var == "LED_OFFSET") val = String(cfg.ledOffset);
+    else if(var == "REVERSED_FALSE") val = !cfg.ledReversed ? "selected" : "";
+    else if(var == "REVERSED_TRUE") val = cfg.ledReversed ? "selected" : "";
+    else if(var == "RPM_GREEN") val = String(cfg.rpmGreenStart);
+    else if(var == "RPM_YELLOW") val = String(cfg.rpmYellowStart);
+    else if(var == "RPM_RED") val = String(cfg.rpmRedStart);
+    else if(var == "RPM_FLASH") val = String(cfg.rpmFlashStart);
+    else if(var == "ZONE_GREEN") val = String(cfg.zoneGreenCount);
+    else if(var == "ZONE_YELLOW") val = String(cfg.zoneYellowCount);
+    else if(var == "ZONE_RED") val = String(cfg.zoneRedCount);
+    xSemaphoreGive(g_mutex);
+    return val;
+  }
+  return String();
+}
+
 // ───────────────────────────────────────────────────────────────────────────
-//  CORE 0 — UDP Task
+//  CORE 0 — Network & Web Server Management Task
 // ───────────────────────────────────────────────────────────────────────────
 void udpTask(void* pvParameters) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  Serial.print("[UDP] Connecting to ");
-  Serial.print(WIFI_SSID);
+  Serial.print("[SYSTEM] Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     vTaskDelay(pdMS_TO_TICKS(500));
     Serial.print(".");
   }
-  Serial.println();
-  Serial.print("[UDP] Connected. IP: ");
+  Serial.println("\n[SYSTEM] WiFi Connected.");
+  Serial.print("[WEB UI] URL: http://");
   Serial.println(WiFi.localIP());
-  Serial.printf("[UDP] Listening on port %d\n", UDP_PORT);
+
+  // Setup asynchronous routes
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html, processor);
+  });
+
+  server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if(request->hasParam("scaleBrightness", true)) cfg.scaleBrightness = request->getParam("scaleBrightness", true)->value().toInt();
+        if(request->hasParam("whiteBrightnessFactor", true)) cfg.whiteBrightnessFactor = request->getParam("whiteBrightnessFactor", true)->value().toFloat();
+        if(request->hasParam("ledOffset", true)) cfg.ledOffset = request->getParam("ledOffset", true)->value().toInt();
+        if(request->hasParam("ledReversed", true)) cfg.ledReversed = request->getParam("ledReversed", true)->value().toInt() == 1;
+        if(request->hasParam("rpmGreenStart", true)) cfg.rpmGreenStart = request->getParam("rpmGreenStart", true)->value().toFloat();
+        if(request->hasParam("rpmYellowStart", true)) cfg.rpmYellowStart = request->getParam("rpmYellowStart", true)->value().toFloat();
+        if(request->hasParam("rpmRedStart", true)) cfg.rpmRedStart = request->getParam("rpmRedStart", true)->value().toFloat();
+        if(request->hasParam("rpmFlashStart", true)) cfg.rpmFlashStart = request->getParam("rpmFlashStart", true)->value().toFloat();
+        if(request->hasParam("zoneGreenCount", true)) cfg.zoneGreenCount = request->getParam("zoneGreenCount", true)->value().toInt();
+        if(request->hasParam("zoneYellowCount", true)) cfg.zoneYellowCount = request->getParam("zoneYellowCount", true)->value().toInt();
+        if(request->hasParam("zoneRedCount", true)) cfg.zoneRedCount = request->getParam("zoneRedCount", true)->value().toInt();
+        xSemaphoreGive(g_mutex);
+    }
+    request->redirect("/");
+  });
+
+  server.begin();
 
   WiFiUDP udp;
   udp.begin(UDP_PORT);
-
   static uint8_t buf[Packet::SIZE];
 
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[UDP] WiFi lost — reconnecting...");
       WiFi.reconnect();
-      while (WiFi.status() != WL_CONNECTED) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-      }
+      while (WiFi.status() != WL_CONNECTED) { vTaskDelay(pdMS_TO_TICKS(500)); }
       udp.begin(UDP_PORT);
     }
 
@@ -113,7 +148,6 @@ void udpTask(void* pvParameters) {
       float spdOut  = 0.0f;
       bool  paused  = true;
 
-      // Check both if the network packet claims race mode is currently running
       if (isRaceOn && maxRpm > 0.0f) {
         pct    = constrain(curRpm / maxRpm, 0.0f, 1.0f);
         rpmOut = curRpm;
@@ -130,7 +164,6 @@ void udpTask(void* pvParameters) {
         xSemaphoreGive(g_mutex);
       }
     }
-
     vTaskDelay(1); 
   }
 }
@@ -152,7 +185,6 @@ void lcdTask(void* pvParameters) {
   }
 
   if (lcdAddr == 0) {
-    Serial.println("[LCD] No display found — LCD task exiting.");
     vTaskDelete(NULL);
     return;
   }
@@ -170,7 +202,6 @@ void lcdTask(void* pvParameters) {
   uint32_t tickerTimer = 0;
   uint32_t lcdTimer    = 0;
   bool     wasTimedOut = false;
-
   char line1[17], line2[17];
 
   for (;;) {
@@ -189,7 +220,6 @@ void lcdTask(void* pvParameters) {
       continue;
     }
 
-    // Combine absolute loss-of-signal timeout with game pause flag state
     bool showTicker = isPaused || (millis() - lastPkt > PACKET_TIMEOUT_MS);
     uint32_t now  = millis();
 
@@ -198,22 +228,18 @@ void lcdTask(void* pvParameters) {
         tickerStep  = 0;
         tickerTimer = now;
         wasTimedOut = true;
-        g_lcd->clear(); // Clear residues cleanly
+        g_lcd->clear();
       }
 
       if (now - tickerTimer >= (uint32_t)TICKER_INTERVAL_MS) {
         tickerStep  = (tickerStep + 1) % TOTAL_STEPS;
         tickerTimer = now;
-
         buildTickerLine(line1, TICKER_MSG, MSG_LEN, tickerStep - MSG_LEN);
         buildTickerLine(line2, TICKER_MSG, MSG_LEN, (16 + MSG_LEN - 1) - tickerStep);
 
-        g_lcd->setCursor(0, 0);
-        g_lcd->print(line1);
-        g_lcd->setCursor(0, 1);
-        g_lcd->print(line2);
+        g_lcd->setCursor(0, 0); g_lcd->print(line1);
+        g_lcd->setCursor(0, 1); g_lcd->print(line2);
       }
-
     } else {
       if (wasTimedOut) {
         lcdTimer    = 0;
@@ -223,7 +249,6 @@ void lcdTask(void* pvParameters) {
 
       if (now - lcdTimer >= (uint32_t)LCD_UPDATE_INTERVAL_MS) {
         lcdTimer = now;
-
         char speedValStr[10];
 #ifdef SPEED_UNIT_MPH
         snprintf(speedValStr, sizeof(speedValStr), "%d MPH", (int)(speedMps * 2.23694f));
@@ -233,13 +258,10 @@ void lcdTask(void* pvParameters) {
         snprintf(line1, sizeof(line1), "SPEED:%10s", speedValStr);
         snprintf(line2, sizeof(line2), "RPM:%12d", (int)rpm);
 
-        g_lcd->setCursor(0, 0);
-        g_lcd->print(line1);
-        g_lcd->setCursor(0, 1);
-        g_lcd->print(line2);
+        g_lcd->setCursor(0, 0); g_lcd->print(line1);
+        g_lcd->setCursor(0, 1); g_lcd->print(line2);
       }
     }
-
     vTaskDelay(pdMS_TO_TICKS(10)); 
   }
 }
@@ -262,79 +284,82 @@ void ledTask(void* pvParameters) {
     float    rpmPct;
     uint32_t lastPkt;
     bool     isPaused;
+    DeviceConfig localCfg; // Thread local snapshot of user profiles
 
     if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-      rpmPct  = g_rpmPercent;
-      lastPkt = g_lastPacketMs;
+      rpmPct   = g_rpmPercent;
+      lastPkt  = g_lastPacketMs;
       isPaused = g_gamePaused;
+      localCfg = cfg; // Copy atomic values out securely 
       xSemaphoreGive(g_mutex);
     } else {
       vTaskDelayUntil(&lastWake, interval);
       continue;
     }
 
+    // Explicit math calculations driven by configurations updated live via HTTP
+    CRGB colorG = CRGB(BASE_COLOR_G).nscale8_video(localCfg.scaleBrightness);
+    CRGB colorY = CRGB(BASE_COLOR_Y).nscale8_video(localCfg.scaleBrightness);
+    CRGB colorR = CRGB(BASE_COLOR_R).nscale8_video(localCfg.scaleBrightness);
+    CRGB colorP = CRGB(BASE_COLOR_P).nscale8_video(localCfg.scaleBrightness);
+    
+    uint8_t whiteVal = (uint8_t)(localCfg.scaleBrightness * localCfg.whiteBrightnessFactor);
+    CRGB whiteBg     = CRGB(whiteVal, whiteVal, whiteVal);
+
+    int zoneGreenFirst  = 0;
+    int zoneYellowFirst = localCfg.zoneGreenCount;
+    int zoneRedFirst    = localCfg.zoneGreenCount + localCfg.zoneYellowCount;
+
     bool absoluteTimeout = (millis() - lastPkt > PACKET_TIMEOUT_MS);
 
-    // ── State 1: Timeout or Game Menu Pause — Purple Pulse ────────────
     if (isPaused || absoluteTimeout) {
-      float phase = (float)(millis() % (uint32_t)PURPLE_PULSE_PERIOD_MS) / (float)PURPLE_PULSE_PERIOD_MS;
+      float phase = (float)(millis() % localCfg.purplePulsePeriodMs) / (float)localCfg.purplePulsePeriodMs;
       float pulseFactor = 0.75f + 0.25f * sinf(phase * 6.28318530f);
-      CRGB pulsedPurple = COLOR_P;
-      pulsedPurple.nscale8_video((uint8_t)(255.0f * pulseFactor));
+      colorP.nscale8_video((uint8_t)(255.0f * pulseFactor));
 
-      fill_solid(leds, NUM_LEDS, pulsedPurple);
+      fill_solid(leds, NUM_LEDS, colorP);
       FastLED.show();
       vTaskDelayUntil(&lastWake, interval);
       continue;
     }
 
-    // ── Flash Timer Management ─────────────────────────────────────────
-    // We update the flash toggle state globally so it can be used below.
-    if (rpmPct >= RPM_FLASH_START) {
+    if (rpmPct >= localCfg.rpmFlashStart) {
       uint32_t now = millis();
       if (now - flashTimer >= (uint32_t)FLASH_INTERVAL_MS) {
         flashOn    = !flashOn;
         flashTimer = now;
       }
     } else {
-      // Out of flash zone: reset variables so it's ready for the next hit
-      flashOn    = true; // Keep it on when not flashing
+      flashOn    = true; 
       flashTimer = millis();
     }
 
-    // ── State 2 & 3: Build the Color Frame ─────────────────────────────
-    // If we are past the flash start point AND the flash phase is "OFF", 
-    // we show a dark ring. Otherwise, we display the normal color pattern.
-    if (rpmPct >= RPM_FLASH_START && !flashOn) {
-      FastLED.clear(); // Entire ring goes dark during the off-cycle
+    if (rpmPct >= localCfg.rpmFlashStart && !flashOn) {
+      FastLED.clear();
     } else {
-      // Build the standard full-color tachometer layout
-      fill_solid(leds, NUM_LEDS, WHITE_BG);
+      fill_solid(leds, NUM_LEDS, whiteBg);
 
-      // Green zone
-      if (rpmPct >= RPM_GREEN_START) {
-        float t = constrain((rpmPct - RPM_GREEN_START) / (RPM_YELLOW_START - RPM_GREEN_START), 0.0f, 1.0f);
-        int count = (int)roundf(t * ZONE_GREEN_COUNT);
+      if (rpmPct >= localCfg.rpmGreenStart) {
+        float t = constrain((rpmPct - localCfg.rpmGreenStart) / (localCfg.rpmYellowStart - localCfg.rpmGreenStart), 0.0f, 1.0f);
+        int count = (int)roundf(t * localCfg.zoneGreenCount);
         for (int i = 0; i < count; i++) {
-          leds[phys(Zone::GREEN_FIRST + i)] = COLOR_G;
+          leds[phys(zoneGreenFirst + i, localCfg.ledOffset, localCfg.ledReversed)] = colorG;
         }
       }
 
-      // Yellow zone
-      if (rpmPct >= RPM_YELLOW_START) {
-        float t = constrain((rpmPct - RPM_YELLOW_START) / (RPM_RED_START - RPM_YELLOW_START), 0.0f, 1.0f);
-        int count = (int)roundf(t * ZONE_YELLOW_COUNT);
+      if (rpmPct >= localCfg.rpmYellowStart) {
+        float t = constrain((rpmPct - localCfg.rpmYellowStart) / (localCfg.rpmRedStart - localCfg.rpmYellowStart), 0.0f, 1.0f);
+        int count = (int)roundf(t * localCfg.zoneYellowCount);
         for (int i = 0; i < count; i++) {
-          leds[phys(Zone::YELLOW_FIRST + i)] = COLOR_Y;
+          leds[phys(zoneYellowFirst + i, localCfg.ledOffset, localCfg.ledReversed)] = colorY;
         }
       }
 
-      // Red zone
-      if (rpmPct >= RPM_RED_START) {
-        float t = constrain((rpmPct - RPM_RED_START) / (RPM_FLASH_START - RPM_RED_START), 0.0f, 1.0f);
-        int count = (int)roundf(t * ZONE_RED_COUNT);
+      if (rpmPct >= localCfg.rpmRedStart) {
+        float t = constrain((rpmPct - localCfg.rpmRedStart) / (localCfg.rpmFlashStart - localCfg.rpmRedStart), 0.0f, 1.0f);
+        int count = (int)roundf(t * localCfg.zoneRedCount);
         for (int i = 0; i < count; i++) {
-          leds[phys(Zone::RED_FIRST + i)] = COLOR_R;
+          leds[phys(zoneRedFirst + i, localCfg.ledOffset, localCfg.ledReversed)] = colorR;
         }
       }
     }
@@ -351,13 +376,12 @@ void setup() {
 
   g_mutex = xSemaphoreCreateMutex();
   if (g_mutex == NULL) {
-    Serial.println("[ERROR] Mutex creation failed — halting.");
     while (true) { vTaskDelay(portMAX_DELAY); }
   }
 
-  xTaskCreatePinnedToCore(udpTask, "UDP_Task", 8192, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(lcdTask, "LCD_Task", 4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(ledTask, "LED_Task", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(udpTask, "UDP_Web_Task", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(lcdTask, "LCD_Task",     4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(ledTask, "LED_Task",     4096, NULL, 2, NULL, 1);
 }
 
 void loop() {
